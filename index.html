@@ -94,12 +94,16 @@
     <div class="card">
       <div>① 차수를 선택하세요</div>
       <div class="choices" id="cohortBtns"></div>
+      <div id="subjectArea" class="hidden">
+        <div>② 교과를 선택하세요</div>
+        <div class="choices" id="subjectBtns"></div>
+      </div>
       <div id="groupArea" class="hidden">
-        <div>② 모둠을 선택하세요</div>
+        <div>③ 모둠을 선택하세요</div>
         <div class="choices" id="groupBtns"></div>
       </div>
       <div id="nameArea" class="hidden">
-        <div>③ 이름을 입력하세요</div>
+        <div>④ 이름을 입력하세요</div>
         <input type="text" id="nameInput" placeholder="예: 심민혜" maxlength="15">
         <button class="btn wide" onclick="enter()">입장하기 ✨</button>
         <div class="small" style="margin-top:8px">같은 이름으로 다시 들어오면 내 기록이 그대로 이어져요.</div>
@@ -235,7 +239,7 @@ const QCARDS = [
   {t:"✨ Bonus · 6개월 뒤", b:"6개월 뒤 다시 이 검사를 한다면, 가장 크게 달라질 역량은 무엇일까요?", c:"#443a6b"},
 ];
 
-let db=null, me={cohort:null,group:null,name:null,uid:null};
+let db=null, me={cohort:null,subject:null,group:null,name:null,uid:null};
 let groupRef=null, groupCache={};
 
 function init(){
@@ -245,13 +249,47 @@ function init(){
   }
   firebase.initializeApp(firebaseConfig);
   db = firebase.database();
-  seedCohorts();
-  loadCohorts();
+  migrateThenSeed();
+}
+
+/* 기존(차수→모둠) 구조를 차수→교과→모둠으로 자동 이전 */
+function migrateThenSeed(){
+  db.ref(ROOT+"/migrated_v2").get().then(f=>{
+    if(f.exists()){ seedCohorts(); loadCohorts(); return; }
+    db.ref(ROOT+"/cohorts").get().then(cs=>{
+      const v=cs.val();
+      const jobs=[];
+      if(v){
+        Object.entries(v).forEach(([cid,c])=>{
+          if(c.groups && !c.subjects){
+            jobs.push(db.ref(`${ROOT}/cohorts/${cid}/subjects/s1`).set({name:"정보",order:1,groups:c.groups}));
+            jobs.push(db.ref(`${ROOT}/cohorts/${cid}/groups`).remove());
+          }
+        });
+      }
+      Promise.all(jobs).then(()=>db.ref(ROOT+"/entries").get()).then(es=>{
+        const ev=es.val(); const ejobs=[];
+        if(ev){
+          Object.entries(ev).forEach(([cid,groups])=>{
+            const keys=Object.keys(groups);
+            const legacy=keys.length && !keys.some(k=>k.startsWith("s"));
+            if(legacy){
+              ejobs.push(db.ref(`${ROOT}/entries/${cid}`).set({s1:groups}));
+            }
+          });
+        }
+        return Promise.all(ejobs);
+      }).then(()=>db.ref(ROOT+"/migrated_v2").set(true))
+        .then(()=>{ seedCohorts(); loadCohorts(); });
+    });
+  });
 }
 function seedCohorts(){
   db.ref(ROOT+"/cohorts").get().then(s=>{
     if(!s.exists()){
-      db.ref(ROOT+"/cohorts/c1").set({name:"1차",order:1,groups:{g1:"1모둠",g2:"2모둠",g3:"3모둠"}});
+      db.ref(ROOT+"/cohorts/c1").set({name:"1차",order:1,
+        subjects:{s1:{name:"정보",order:1,groups:{g1:"1모둠",g2:"2모둠",g3:"3모둠"}}}});
+      db.ref(ROOT+"/migrated_v2").set(true);
     }
   });
 }
@@ -263,18 +301,38 @@ function loadCohorts(){
       const b=document.createElement("button");
       b.className="btn ghost"+(me.cohort===cid?" sel":"");
       b.textContent=c.name;
-      b.onclick=()=>{me.cohort=cid; me.group=null; loadCohorts(); renderGroups();};
+      b.onclick=()=>{me.cohort=cid; me.subject=null; me.group=null;
+        document.getElementById("groupArea").classList.add("hidden");
+        document.getElementById("nameArea").classList.add("hidden");
+        loadCohorts(); renderSubjects();};
       el.appendChild(b);
     });
-    if(me.cohort) renderGroups();
+    if(me.cohort) renderSubjects();
     renderAdminCohorts();
   });
 }
+function renderSubjects(){
+  const c=window._cohorts[me.cohort]; if(!c) return;
+  document.getElementById("subjectArea").classList.remove("hidden");
+  const el=document.getElementById("subjectBtns"); el.innerHTML="";
+  Object.entries(c.subjects||{}).sort((a,b)=>(a[1].order||0)-(b[1].order||0)).forEach(([sid,sub])=>{
+    const b=document.createElement("button");
+    b.className="btn ghost"+(me.subject===sid?" sel":"");
+    b.textContent=sub.name;
+    b.onclick=()=>{me.subject=sid; me.group=null;
+      document.getElementById("nameArea").classList.add("hidden");
+      renderSubjects(); renderGroups();};
+    el.appendChild(b);
+  });
+  if(!el.children.length) el.innerHTML='<div class="small">아직 교과가 없어요. 어드민에서 추가해 주세요.</div>';
+  if(me.subject) renderGroups();
+}
 function renderGroups(){
   const c=window._cohorts[me.cohort]; if(!c) return;
+  const sub=(c.subjects||{})[me.subject]; if(!sub) return;
   document.getElementById("groupArea").classList.remove("hidden");
   const el=document.getElementById("groupBtns"); el.innerHTML="";
-  Object.entries(c.groups||{}).sort().forEach(([gid,g])=>{
+  Object.entries(sub.groups||{}).sort().forEach(([gid,g])=>{
     const b=document.createElement("button");
     b.className="btn ghost"+(me.group===gid?" sel":"");
     b.textContent=g;
@@ -287,11 +345,12 @@ function enter(){
   const n=document.getElementById("nameInput").value.trim();
   if(!n){ alert("이름을 입력해 주세요!"); return; }
   me.name=n; me.uid=sanitize(n);
-  db.ref(`${ROOT}/entries/${me.cohort}/${me.group}/${me.uid}/name`).set(me.name);
+  db.ref(myPath()+"/name").set(me.name);
   document.getElementById("scrEntry").classList.add("hidden");
   document.getElementById("scrMain").classList.remove("hidden");
+  const c=window._cohorts[me.cohort];
   document.getElementById("whoami").textContent =
-    `${window._cohorts[me.cohort].name} · ${window._cohorts[me.cohort].groups[me.group]} · ${me.name} 선생님`;
+    `${c.name} · ${c.subjects[me.subject].name} · ${c.subjects[me.subject].groups[me.group]} · ${me.name} 선생님`;
   buildPosters(); buildQcards(); watchGroup(); showStep(0);
 }
 function leave(){
@@ -358,16 +417,16 @@ function buildQcards(){
 function sendCheer(uid){
   const ta=document.getElementById("cheer_"+uid);
   const t=ta.value.trim(); if(!t){ alert("한마디를 적어 주세요!"); return; }
-  db.ref(`${ROOT}/entries/${me.cohort}/${me.group}/${uid}/cheers`).push({from:me.name,text:t,ts:Date.now()});
+  db.ref(`${ROOT}/entries/${me.cohort}/${me.subject}/${me.group}/${uid}/cheers`).push({from:me.name,text:t,ts:Date.now()});
   ta.value=""; alert("💌 전달했어요!");
 }
 
-function myPath(){ return `${ROOT}/entries/${me.cohort}/${me.group}/${me.uid}`; }
+function myPath(){ return `${ROOT}/entries/${me.cohort}/${me.subject}/${me.group}/${me.uid}`; }
 
 /* 실시간 모둠 데이터 */
 function watchGroup(){
   if(groupRef) groupRef.off();
-  groupRef=db.ref(`${ROOT}/entries/${me.cohort}/${me.group}`);
+  groupRef=db.ref(`${ROOT}/entries/${me.cohort}/${me.subject}/${me.group}`);
   groupRef.on("value",s=>{
     groupCache=s.val()||{};
     renderStep1(); renderPreds(); renderGallery(); renderCheers();
@@ -460,13 +519,20 @@ function addCohort(){
   const n=document.getElementById("newCohort").value.trim();
   if(!n) return;
   const id="c"+Date.now();
-  db.ref(`${ROOT}/cohorts/${id}`).set({name:n,order:Date.now(),groups:{g1:"1모둠",g2:"2모둠",g3:"3모둠"}});
+  db.ref(`${ROOT}/cohorts/${id}`).set({name:n,order:Date.now(),subjects:{}});
   document.getElementById("newCohort").value="";
 }
-function addGroup(cid){
-  const c=window._cohorts[cid];
-  const num=Object.keys(c.groups||{}).length+1;
-  db.ref(`${ROOT}/cohorts/${cid}/groups/g${num}`).set(num+"모둠");
+function addSubject(cid){
+  const n=prompt("교과 이름을 입력하세요 (예: 수학)");
+  if(!n) return;
+  const sid="s"+Date.now();
+  db.ref(`${ROOT}/cohorts/${cid}/subjects/${sid}`).set(
+    {name:n.trim(),order:Date.now(),groups:{g1:"1모둠",g2:"2모둠",g3:"3모둠"}});
+}
+function addGroup(cid,sid){
+  const c=window._cohorts[cid]; const sub=c.subjects[sid];
+  const num=Object.keys(sub.groups||{}).length+1;
+  db.ref(`${ROOT}/cohorts/${cid}/subjects/${sid}/groups/g${num}`).set(num+"모둠");
 }
 function renderAdminCohorts(){
   const el=document.getElementById("adminCohorts");
@@ -474,40 +540,48 @@ function renderAdminCohorts(){
   el.innerHTML="";
   Object.entries(window._cohorts).sort((a,b)=>(a[1].order||0)-(b[1].order||0)).forEach(([cid,c])=>{
     const d=document.createElement("div"); d.className="adminrow";
-    d.innerHTML=`<b>${c.name}</b> : ${Object.values(c.groups||{}).join(", ")}
-      <button class="btn ghost" style="font-size:22px;padding:8px 16px" onclick="addGroup('${cid}')">+ 모둠 추가</button>`;
-    el.appendChild(d);
+    let h=`<div style="font-size:30px"><b>${c.name}</b>
+      <button class="btn ghost" style="font-size:22px;padding:8px 16px" onclick="addSubject('${cid}')">+ 교과 추가</button></div>`;
+    Object.entries(c.subjects||{}).sort((a,b)=>(a[1].order||0)-(b[1].order||0)).forEach(([sid,sub])=>{
+      h+=`<div style="margin:8px 0 0 20px">📚 <b style="color:#ffd166">${esc(sub.name)}</b> : ${Object.values(sub.groups||{}).join(", ")}
+        <button class="btn ghost" style="font-size:20px;padding:6px 14px" onclick="addGroup('${cid}','${sid}')">+ 모둠 추가</button></div>`;
+    });
+    if(!c.subjects||!Object.keys(c.subjects).length) h+=`<div class="small" style="margin-left:20px">교과 없음</div>`;
+    d.innerHTML=h; el.appendChild(d);
   });
 }
 function loadAdminData(){
   db.ref(ROOT+"/entries").on("value",s=>{
     const all=s.val()||{};
     const el=document.getElementById("adminData"); el.innerHTML="";
-    Object.entries(all).forEach(([cid,groups])=>{
-      const cname=(window._cohorts[cid]||{}).name||cid;
-      Object.entries(groups).forEach(([gid,people])=>{
-        const gname=((window._cohorts[cid]||{}).groups||{})[gid]||gid;
-        Object.entries(people).forEach(([uid,u])=>{
-          const d=document.createElement("div"); d.className="adminrow";
-          let h=`<div style="font-size:30px"><span class="tag">${cname}</span><span class="tag">${gname}</span> <b style="color:#ffd166">${esc(u.name||uid)}</b>
-            <button class="btn ghost" style="font-size:20px;padding:6px 14px;float:right" onclick="delEntry('${cid}','${gid}','${uid}')">삭제</button></div>`;
-          if(u.step1 && u.step1.pick!=null) h+=`<div>1️⃣ ${POSTERS[u.step1.pick].label}</div>`;
-          if(u.step2) h+=`<div>2️⃣ ${esc(u.step2.comp||"")} — <span class="small">${esc(u.step2.why||"")}</span></div>`;
-          if(u.step3) h+=`<div>3️⃣ <img src="${u.step3.img}" style="max-width:180px;border-radius:10px;vertical-align:middle;cursor:pointer" onclick="document.getElementById('bigimgSrc').src=this.src;document.getElementById('bigimg').style.display='flex'"></div>`;
-          if(u.cheers) h+=`<div>4️⃣ `+Object.values(u.cheers).map(c=>`<span class="tag">${esc(c.from)}: ${esc(c.text)}</span>`).join(" ")+`</div>`;
-          d.innerHTML=h; el.appendChild(d);
+    Object.entries(all).forEach(([cid,subjects])=>{
+      const cinfo=window._cohorts[cid]||{};
+      Object.entries(subjects).forEach(([sid,groups])=>{
+        const sname=((cinfo.subjects||{})[sid]||{}).name||sid;
+        Object.entries(groups).forEach(([gid,people])=>{
+          const gname=(((cinfo.subjects||{})[sid]||{}).groups||{})[gid]||gid;
+          Object.entries(people).forEach(([uid,u])=>{
+            const d=document.createElement("div"); d.className="adminrow";
+            let h=`<div style="font-size:30px"><span class="tag">${cinfo.name||cid}</span><span class="tag">${sname}</span><span class="tag">${gname}</span> <b style="color:#ffd166">${esc(u.name||uid)}</b>
+              <button class="btn ghost" style="font-size:20px;padding:6px 14px;float:right" onclick="delEntry('${cid}','${sid}','${gid}','${uid}')">삭제</button></div>`;
+            if(u.step1 && u.step1.pick!=null) h+=`<div>1️⃣ ${POSTERS[u.step1.pick].label}</div>`;
+            if(u.step2) h+=`<div>2️⃣ ${esc(u.step2.comp||"")} — <span class="small">${esc(u.step2.why||"")}</span></div>`;
+            if(u.step3) h+=`<div>3️⃣ <img src="${u.step3.img}" style="max-width:180px;border-radius:10px;vertical-align:middle;cursor:pointer" onclick="document.getElementById('bigimgSrc').src=this.src;document.getElementById('bigimg').style.display='flex'"></div>`;
+            if(u.cheers) h+=`<div>4️⃣ `+Object.values(u.cheers).map(c=>`<span class="tag">${esc(c.from)}: ${esc(c.text)}</span>`).join(" ")+`</div>`;
+            d.innerHTML=h; el.appendChild(d);
+          });
         });
       });
     });
     if(!el.children.length) el.innerHTML='<div class="small">아직 기록이 없어요.</div>';
   });
 }
-function delEntry(cid,gid,uid){
+function delEntry(cid,sid,gid,uid){
   if(confirm("이 참가자의 기록을 삭제할까요?"))
-    db.ref(`${ROOT}/entries/${cid}/${gid}/${uid}`).remove();
+    db.ref(`${ROOT}/entries/${cid}/${sid}/${gid}/${uid}`).remove();
 }
 function resetAll(){
-  const p=prompt("⚠️ 모든 참가자 기록이 삭제됩니다 (차수·모둠 구성은 유지).\n계속하려면 어드민 비밀번호를 다시 입력하세요.");
+  const p=prompt("⚠️ 모든 참가자 기록이 삭제됩니다 (차수·교과·모둠 구성은 유지).\n계속하려면 어드민 비밀번호를 다시 입력하세요.");
   if(p===null) return;
   if(p!==ADMIN_PW){ alert("비밀번호가 달라요!"); return; }
   db.ref(ROOT+"/entries").remove().then(()=>alert("🧹 전체 기록이 초기화되었어요!"));
